@@ -1,195 +1,303 @@
+# some useful environment variables:
+#
+# TORCH_CUDA_ARCH_LIST
+#   specify which CUDA architectures to build for
+#
+# IGNORE_TORCH_VER
+#   ignore version requirements for PyTorch
+
 import os
-import site
-from pathlib import Path
-from setuptools import setup, find_packages
+from setuptools import setup, find_packages, dist
+import importlib
+from pkg_resources import parse_version
 import subprocess
-from distutils.extension import Extension
+import warnings
+
+TORCH_MIN_VER = '1.5.0'
+TORCH_MAX_VER = '1.10.2'
+CYTHON_MIN_VER = '0.29.20'
+INCLUDE_EXPERIMENTAL = os.getenv('KAOLIN_INSTALL_EXPERIMENTAL') is not None
+IGNORE_TORCH_VER = os.getenv('IGNORE_TORCH_VER') is not None
+
+# Module required before installation
+# trying to install it ahead turned out to be too unstable.
+torch_spec = importlib.util.find_spec("torch")
+if torch_spec is None:
+    raise ImportError(
+        f"Kaolin requires PyTorch >={TORCH_MIN_VER}, <={TORCH_MAX_VER}, "
+        "but couldn't find the module installed."
+    )
+else:
+    import torch
+    torch_ver = parse_version(torch.__version__)
+    if (torch_ver < parse_version(TORCH_MIN_VER) or
+        torch_ver > parse_version(TORCH_MAX_VER)):
+        if IGNORE_TORCH_VER:
+            warnings.warn(
+                f'Kaolin is compatible with PyTorch >={TORCH_MIN_VER}, <={TORCH_MAX_VER}, '
+                f'but found version {torch.__version__}. Continuing with the installed '
+                'version as IGNORE_TORCH_VER is set.'
+            )
+        else:
+            raise ImportError(
+                f'Kaolin requires PyTorch >={TORCH_MIN_VER}, <={TORCH_MAX_VER}, '
+                f'but found version {torch.__version__} instead.'
+                'If you wish to install with this specific version set IGNORE_TORCH_VER=1.'
+            )
+
+missing_modules = []
+
+cython_spec = importlib.util.find_spec("cython")
+if cython_spec is None:
+    warnings.warn(
+        f"Kaolin requires cython == {CYTHON_MIN_VER}, "
+        "but couldn't find the module installed. "
+        "This setup is gonna try to install it..."
+    )
+    missing_modules.append(f'cython=={CYTHON_MIN_VER}')
+
+else:
+    import Cython
+    cython_ver = parse_version(Cython.__version__)
+    if cython_ver != parse_version('0.29.20'):
+        raise ImportError('Kaolin requires cython == 0.29.20, '
+                          f'but found version {Cython.__version__} instead.')
+
+numpy_spec = importlib.util.find_spec("numpy")
+
+if numpy_spec is None:
+    warnings.warn(
+        f"Kaolin requires numpy, but couldn't find the module installed. "
+        "This setup is gonna try to install it..."
+    )
+    missing_modules.append('numpy')
+
+dist.Distribution().fetch_build_eggs(missing_modules)
+
+cython_spec = importlib.util.find_spec("cython")
+if cython_spec is None:
+    raise ImportError(
+        f"Kaolin requires cython == {CYTHON_MIN_VER} "
+        "but couldn't find or install it."
+    )
+
+numpy_spec = importlib.util.find_spec("numpy")
+if numpy_spec is None:
+    raise ImportError(
+        f"Kaolin requires numpy but couldn't find or install it."
+    )
+
+import os
+import sys
+import logging
+import glob
+
+import numpy
+import torch
+from torch.utils.cpp_extension import BuildExtension, CppExtension, CUDAExtension, CUDA_HOME
+
 cwd = os.path.dirname(os.path.abspath(__file__))
 
-###############################################################
-# Version, create_version_file, and package name
-#
-# Example for release (1.2.3):
-#  KAOLIN_BUILD_VERSION=1.2.3 \
-#  KAOLIN_BUILD_NUMBER=1 python setup.py install
-###############################################################
-package_name = os.getenv('KAOLIN_PACKAGE_NAME', 'kaolin')
-version = '0.2.0'
-if os.getenv('KAOLIN_PACKAGE_NAME'):
-    assert os.getenv('KAOLIN_BUILD_NUMBER') is not None
-    build_number = int(os.getenv('KAOLIN_BUILD_NUMBER'))
-    version = os.getenv('KAOLIN_BUILD_VERSION')
-    if build_number > 1:
-        version += '.post' + str(build_number)
-else:
-    try:
-        sha = subprocess.check_output(
-            ['git', 'rev-parse', 'HEAD'], cwd=cwd).decode('ascii').strip()
-        version += '+' + sha[:7]
-    except Exception:
-        pass
-print('Building wheel {}-{}'.format(package_name, version))
+logger = logging.getLogger()
+logging.basicConfig(format='%(levelname)s - %(message)s')
+
+def get_cuda_bare_metal_version(cuda_dir):
+    raw_output = subprocess.check_output([cuda_dir + "/bin/nvcc", "-V"], universal_newlines=True)
+    output = raw_output.split()
+    release_idx = output.index("release") + 1
+    release = output[release_idx].split(".")
+    bare_metal_major = release[0]
+    bare_metal_minor = release[1][0]
+
+    return raw_output, bare_metal_major, bare_metal_minor
+
+if not torch.cuda.is_available():
+    if os.getenv('FORCE_CUDA', '0') == '1':
+        # From: https://github.com/NVIDIA/apex/blob/c4e85f7bf144cb0e368da96d339a6cbd9882cea5/setup.py
+        # Extension builds after https://github.com/pytorch/pytorch/pull/23408 attempt to query torch.cuda.get_device_capability(),
+        # which will fail if you are compiling in an environment without visible GPUs (e.g. during an nvidia-docker build command).
+        logging.warning(
+            "Torch did not find available GPUs on this system.\n"
+            "If your intention is to cross-compile, this is not an error.\n"
+            "By default, Apex will cross-compile for Pascal (compute capabilities 6.0, 6.1, 6.2),\n"
+            "Volta (compute capability 7.0), Turing (compute capability 7.5),\n"
+            "and, if the CUDA version is >= 11.0, Ampere (compute capability 8.0).\n"
+            "If you wish to cross-compile for a single specific architecture,\n"
+            'export TORCH_CUDA_ARCH_LIST="compute capability" before running setup.py.\n'
+        )
+        if os.getenv("TORCH_CUDA_ARCH_LIST", None) is None:
+            _, bare_metal_major, bare_metal_minor = get_cuda_bare_metal_version(CUDA_HOME)
+            if int(bare_metal_major) == 11:
+                if int(bare_metal_minor) == 0:
+                    os.environ["TORCH_CUDA_ARCH_LIST"] = "6.0;6.1;6.2;7.0;7.5;8.0"
+                else:
+                    os.environ["TORCH_CUDA_ARCH_LIST"] = "6.0;6.1;6.2;7.0;7.5;8.0;8.6"
+            else:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = "6.0;6.1;6.2;7.0;7.5"
+    else:
+        logging.warning(
+            "Torch did not find available GPUs on this system.\n"
+            "Kaolin will install only with CPU support and will have very limited features.\n"
+            'If your wish to cross-compile for GPU `export FORCE_CUDA=1` before running setup.py\n'
+            "By default, Apex will cross-compile for Pascal (compute capabilities 6.0, 6.1, 6.2),\n"
+            "Volta (compute capability 7.0), Turing (compute capability 7.5),\n"
+            "and, if the CUDA version is >= 11.0, Ampere (compute capability 8.0).\n"
+            "If you wish to cross-compile for a single specific architecture,\n"
+            'export TORCH_CUDA_ARCH_LIST="compute capability" before running setup.py.\n'
+        )
+
+PACKAGE_NAME = 'kaolin'
+DESCRIPTION = 'Kaolin: A PyTorch library for accelerating 3D deep learning research'
+URL = 'https://github.com/NVIDIAGameWorks/kaolin'
+AUTHOR = 'NVIDIA'
+LICENSE = 'Apache License 2.0'
+DOWNLOAD_URL = ''
+LONG_DESCRIPTION = """
+Kaolin is a PyTorch library aiming to accelerate 3D deep learning research. Kaolin provides efficient implementations
+of differentiable 3D modules for use in deep learning systems. With functionality to load and preprocess several popular
+3D datasets, and native functions to manipulate meshes, pointclouds, signed distance functions, and voxel grids, Kaolin
+mitigates the need to write wasteful boilerplate code. Kaolin packages together several differentiable graphics modules
+including rendering, lighting, shading, and view warping. Kaolin also supports an array of loss functions and evaluation
+metrics for seamless evaluation and provides visualization functionality to render the 3D results. Importantly, we curate
+a comprehensive model zoo comprising many state-of-the-art 3D deep learning architectures, to serve as a starting point
+for future research endeavours.
+"""
+
+version = '0.10.0'
 
 
-# All the work we need to do _before_ setup runs
-def build_deps():
-    print('--Building version ' + version)
-    # version_path = os.path.join(cwd, 'kaolin', 'version.py')
-    # with open(version_path, 'w') as f:
-    #     f.write('__version__ = \'{}\'\n'.format(version))
-
-    # build nv-usd
-    os.system('./buildusd.sh')
+def write_version_file():
+    version_path = os.path.join(cwd, 'kaolin', 'version.py')
+    with open(version_path, 'w') as f:
+        f.write("__version__ = '{}'\n".format(version))
 
 
-def read(*names, **kwargs):
-    with io.open(
-        os.path.join(os.path.dirname(__file__), *names),
-        encoding=kwargs.get('encoding', 'utf8')
-    ) as fp:
-        return fp.read()
+write_version_file()
 
 
-requirements = [
-    'matplotlib<3.0.0',
-    'scikit-image',
-    'shapely',
-    'trimesh>=3.0',
-    'scipy',
-    'sphinx',
-    # 'sphinx_rtd_theme',
-    'pytest>=4.6',
-    'pytest-cov>=2.7',
-    'tqdm',
-    'pytest',
-    'pptk',
-    'Cython',
-    'autopep8',
-    'flake8',
-]
+def get_requirements():
+    requirements = []
+    requirements.append('scipy>=1.2.0,<=1.5.2')
+    requirements.append('Pillow>=8.0.0')
+    requirements.append('tqdm>=4.51.0')
+    if sys.version_info >= (3, 10):
+        warnings.warn("usd-core is not compatible with python_version >= 3.10 "
+                      "and won't be installed, please use supported python_version "
+                      "to use USD related features")
+    requirements.append('usd-core>=20.11; python_version < "3.10"')
+    if INCLUDE_EXPERIMENTAL:
+        requirements.append('tornado==6.1')
+        requirements.append('flask==2.0.3')
+    return requirements
+
+
+def get_scripts():
+    if INCLUDE_EXPERIMENTAL:
+        logger.info('Including experimental features')
+        return ['kaolin/experimental/dash3d/kaolin-dash3d']
+    return []
+
+
+def get_extensions():
+    extra_compile_args = {'cxx': ['-O3']}
+    define_macros = []
+    include_dirs = []
+    sources = glob.glob('kaolin/csrc/**/*.cpp', recursive=True)
+    # FORCE_CUDA is for cross-compilation in docker build
+    if torch.cuda.is_available() or os.getenv('FORCE_CUDA', '0') == '1':
+        with_cuda = True
+        define_macros += [("WITH_CUDA", None), ("THRUST_IGNORE_CUB_VERSION_CHECK", None)]
+        sources += glob.glob('kaolin/csrc/**/*.cu', recursive=True)
+        extension = CUDAExtension
+        extra_compile_args.update({'nvcc': [
+            '-O3',
+            '-DWITH_CUDA',
+            '-DTHRUST_IGNORE_CUB_VERSION_CHECK'
+        ]})
+        include_dirs = get_include_dirs()
+    else:
+        extension = CppExtension
+        with_cuda = False
+    extensions = []
+    extensions.append(
+        extension(
+            name='kaolin._C',
+            sources=sources,
+            define_macros=define_macros,
+            extra_compile_args=extra_compile_args,
+            include_dirs=include_dirs
+        )
+    )
+
+    # use cudart_static instead
+    for extension in extensions:
+        extension.libraries = ['cudart_static' if x == 'cudart' else x
+                               for x in extension.libraries]
+
+    use_cython = True
+    ext = '.pyx' if use_cython else '.cpp'
+
+    cython_extensions = [
+        CppExtension(
+            'kaolin.ops.mesh.triangle_hash',
+            sources=[
+                f'kaolin/cython/ops/mesh/triangle_hash{ext}'
+            ],
+            include_dirs=[numpy.get_include()],
+        ),
+        CppExtension(
+            'kaolin.ops.conversions.mise',
+            sources=[
+                f'kaolin/cython/ops/conversions/mise{ext}'
+            ],
+        ),
+    ]
+
+    if use_cython:
+        from Cython.Build import cythonize
+        from Cython.Compiler import Options
+        compiler_directives = Options.get_directive_defaults()
+        compiler_directives["emit_code_comments"] = False
+        cython_extensions = cythonize(cython_extensions, language='c++',
+                                      compiler_directives=compiler_directives)
+
+    return extensions + cython_extensions
+
+def get_include_dirs():
+    include_dirs = []
+    if torch.cuda.is_available() or os.getenv('FORCE_CUDA', '0') == '1':
+        _, bare_metal_major, _ = get_cuda_bare_metal_version(CUDA_HOME)
+        if "CUB_HOME" in os.environ:
+            logging.warning(f'Including CUB_HOME ({os.environ["CUB_HOME"]}).')
+            include_dirs.append(os.environ["CUB_HOME"])
+        else:
+            if int(bare_metal_major) < 11:
+                logging.warning(f'Including default CUB_HOME ({os.path.join(cwd, "third_party/cub")}).')
+                include_dirs.append(os.path.join(cwd, 'third_party/cub'))
+
+    return include_dirs
 
 
 if __name__ == '__main__':
-
-    build_deps()
     setup(
         # Metadata
-        name=package_name,
+        name=PACKAGE_NAME,
         version=version,
-        author='nvidia',
-        description='Kaolin: A PyTorch library for accelerating 3D deep learning research',
-        url='',
-        long_description='',
-        license='',
-        python_requires='>3.6',
+        author=AUTHOR,
+        description=DESCRIPTION,
+        url=URL,
+        long_description=LONG_DESCRIPTION,
+        license=LICENSE,
+        python_requires='~=3.6',
 
         # Package info
-        packages=find_packages(exclude=('docs', 'test', 'examples')),
-
-        zip_safe=True,
-        install_requires=requirements
-        # ext_modules=ext_modules,
-        # cmdclass = {'build_ext': BuildExtension}
-
-    )
-
-    import torch
-    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-    import Cython
-    from Cython.Build import cythonize
-    import numpy as np
-
-    triangle_hash_module = Extension(
-        'kaolin.triangle_hash',
-        sources=[
-            'kaolin/cython/triangle_hash.pyx'
-        ],
-        include_dirs=[np.get_include()],
-        # libraries=['m']
-    )
-
-    mise_module = Extension(
-        'kaolin.mise',
-        sources=[
-            'kaolin/cython/mise.pyx'
-        ],
-        # libraries=['m'],
-        include_dirs=[np.get_include()]
-    )
-    mcubes_module = Extension(
-        'kaolin.mcubes',
-        sources=[
-            'kaolin/cython/mcubes.pyx',
-            'kaolin/cython/pywrapper.cpp',
-            'kaolin/cython/marchingcubes.cpp'
-        ],
-        language='c++',
-        extra_compile_args=['-std=c++11'],
-        include_dirs=[np.get_include()]
-    )
-    nnsearch_module = Extension(
-        'kaolin.nnsearch',
-        sources=[
-            'kaolin/cython/nnsearch.pyx'
-        ],
-        include_dirs=[np.get_include()]
-    )
-
-    ext_modules = [
-        CUDAExtension('kaolin.cuda.load_textures', [
-            'kaolin/cuda/load_textures_cuda.cpp',
-            'kaolin/cuda/load_textures_cuda_kernel.cu',
-        ]),
-        CUDAExtension('kaolin.cuda.sided_distance', [
-            'kaolin/cuda/sided_distance.cpp',
-            'kaolin/cuda/sided_distance_cuda.cu',
-        ]),
-        CUDAExtension('kaolin.cuda.furthest_point_sampling', [
-            'kaolin/cuda/furthest_point_sampling.cpp',
-            'kaolin/cuda/furthest_point_sampling_cuda.cu',
-        ]),
-        CUDAExtension('kaolin.cuda.ball_query', [
-            'kaolin/cuda/ball_query.cpp',
-            'kaolin/cuda/ball_query_cuda.cu',
-        ]),
-        CUDAExtension('kaolin.cuda.three_nn', [
-            'kaolin/cuda/three_nn.cpp',
-            'kaolin/cuda/three_nn_cuda.cu',
-        ]),
-        CUDAExtension('kaolin.cuda.tri_distance', [
-            'kaolin/cuda/triangle_distance.cpp',
-            'kaolin/cuda/triangle_distance_cuda.cu',
-        ]),
-        CUDAExtension('kaolin.cuda.mesh_intersection', [
-            'kaolin/cuda/mesh_intersection.cpp',
-            'kaolin/cuda/mesh_intersection_cuda.cu',
-        ]),
-        CUDAExtension('kaolin.graphics.nmr.cuda.rasterize_cuda', [
-            'kaolin/graphics/nmr/cuda/rasterize_cuda.cpp',
-            'kaolin/graphics/nmr/cuda/rasterize_cuda_kernel.cu',
-        ]),
-        triangle_hash_module,
-        mise_module,
-        mcubes_module,
-        nnsearch_module,
-    ]
-
-    setup(
-        # Metadata
-        name=package_name,
-        version=version,
-        author='nvidia',
-        description='A 3D Deep Learning Library',
-        url='',
-        long_description='',
-        license='',
-        python_requires='>3.6',
-
-        # Package info
-        packages=find_packages(exclude=('docs', 'test', 'examples')),
-
-        zip_safe=True,
-        ext_modules=cythonize(ext_modules),
-        cmdclass={'build_ext': BuildExtension}
-
+        packages=find_packages(exclude=('docs', 'tests', 'examples')),
+        scripts=get_scripts(),
+        include_package_data=True,
+        install_requires=get_requirements(),
+        zip_safe=False,
+        ext_modules=get_extensions(),
+        cmdclass={
+            'build_ext': BuildExtension.with_options(no_python_abi_suffix=True)
+        }
     )
